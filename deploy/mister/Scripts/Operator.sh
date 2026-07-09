@@ -5,14 +5,16 @@
 # cartridge and the matching FPGA core launches automatically; remove it to
 # return to the menu. Run this from the MiSTer Scripts menu (F12 -> Scripts).
 
-OPDIR="/media/fat/Scripts/.operator"
-BIN="$OPDIR/zaparoo-operator"
-LOG="/tmp/zaparoo-operator.log"
-TOKEN="/tmp/zaparoo-operator.token"
-STATUS="/tmp/zaparoo-operator.status"
-STARTUP="/media/fat/linux/user-startup.sh"
-ZAPCFG="/media/fat/zaparoo/config.toml"
-ZAPSH="/media/fat/Scripts/zaparoo.sh"
+# Paths are overridable via environment so Operator_test.sh can point them at
+# a temp dir; defaults are the real MiSTer locations.
+OPDIR="${OPDIR:-/media/fat/Scripts/.operator}"
+BIN="${BIN:-$OPDIR/zaparoo-operator}"
+LOG="${LOG:-/tmp/zaparoo-operator.log}"
+TOKEN="${TOKEN:-/tmp/zaparoo-operator.token}"
+STATUS="${STATUS:-/tmp/zaparoo-operator.status}"
+STARTUP="${STARTUP:-/media/fat/linux/user-startup.sh}"
+ZAPCFG="${ZAPCFG:-/media/fat/zaparoo/config.toml}"
+ZAPSH="${ZAPSH:-/media/fat/Scripts/zaparoo.sh}"
 BEGIN="#==== Epilogue Operator BEGIN ===="
 END="#==== Epilogue Operator END ===="
 RUNLINE="[ \"\$1\" != \"stop\" ] && [ -x $BIN ] && $BIN bridge > $LOG 2>&1 &"
@@ -137,19 +139,23 @@ menu() {
   clear
 }
 
-if [ ! -x "$BIN" ]; then
-  echo "ERROR: $BIN not found. Reinstall the Operator bridge." >&2
-  sleep 3; exit 1
-fi
+# Guarded so Operator_test.sh can source this file for its functions without
+# running the installer.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  if [ ! -x "$BIN" ]; then
+    echo "ERROR: $BIN not found. Reinstall the Operator bridge." >&2
+    sleep 3; exit 1
+  fi
 
-# First run sets everything up; thereafter it (re)confirms and shows the menu.
-ensure_config
-notify_config_replaced
-autostart_enabled || enable_autostart
-start_bridge
+  # First run sets everything up; thereafter it (re)confirms and shows the menu.
+  ensure_config
+  notify_config_replaced
+  autostart_enabled || enable_autostart
+  start_bridge
 
-if command -v dialog >/dev/null 2>&1 && [ -t 1 ]; then
-  menu
-else
-  clear; echo "Epilogue Operator bridge"; echo; status_text; echo; echo "Log: $LOG"; sleep 4
+  if command -v dialog >/dev/null 2>&1 && [ -t 1 ]; then
+    menu
+  else
+    clear; echo "Epilogue Operator bridge"; echo; status_text; echo; echo "Log: $LOG"; sleep 4
+  fi
 fi
