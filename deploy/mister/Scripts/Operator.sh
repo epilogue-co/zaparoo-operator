@@ -23,17 +23,25 @@ is_running()        { pgrep -f "$BIN bridge" >/dev/null 2>&1; }
 autostart_enabled() { [ -f "$STARTUP" ] && grep -qF "$BEGIN" "$STARTUP"; }
 operator_present()  { "$BIN" detect 2>/dev/null | grep -qi "Operator"; }
 
-# config_ok reports whether the Zaparoo config already has the three settings the
+# config_ok reports whether the Zaparoo config already has the settings the
 # Operator needs: auto_detect off (so libnfc/pn532 don't grab our /dev/ttyACM*),
-# hold mode (so removing the cart stops the core), and a file reader on our token.
-# Matches must be on real (non-commented) setting lines, so a commented-out block
-# never makes a broken config look ok.
+# hold mode (so removing the cart stops the core), and a [[readers.connect]]
+# entry with BOTH driver='file' and a path on our token -- not just a path=
+# line anywhere in the file, which could belong to an unrelated entry or
+# survive with its driver commented out, silently doing nothing. Matches must
+# be on real (non-commented) setting lines, so a commented-out block never
+# makes a broken config look ok.
 config_ok() {
   [ -f "$ZAPCFG" ] || return 1
   grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG" || return 1
   grep -Eq "^[[:space:]]*mode[[:space:]]*=[[:space:]]*'?hold'?" "$ZAPCFG" || return 1
-  # token must be on a real (non-commented) path = ... line
-  grep -E "^[[:space:]]*path[[:space:]]*=" "$ZAPCFG" | grep -qF "$TOKEN" || return 1
+  awk -v tok="$TOKEN" '
+    /^\[\[readers\.connect\]\]/ { driver=0; path=0 }
+    /^[[:space:]]*driver[[:space:]]*=/ { if ($0 ~ /file/) driver=1 }
+    /^[[:space:]]*path[[:space:]]*=/ { if (index($0, tok)) path=1 }
+    driver && path { found=1 }
+    END { exit !found }
+  ' "$ZAPCFG" || return 1
   return 0
 }
 
@@ -80,19 +88,64 @@ notify_config_replaced() {
   fi
 }
 
-# Idempotently strip our marker block, then re-append it.
+# with_lock runs its argument while holding a simple mkdir-based mutex on
+# $STARTUP, so two concurrent Operator.sh invocations (e.g. a double F12 tap
+# on first install, before autostart is enabled) can't race on the same
+# read-modify-write cycle: reproduced 5/5 without this, duplicating the
+# autostart block (bridge launched twice at boot) or, under heavier
+# contention, silently deleting another tool's unrelated autostart line with
+# no way to recover it. mkdir is atomic even on MiSTer's filesystem; a stale
+# lock left by a killed process is cleared after LOCK_STALE_SECS.
+LOCK_STALE_SECS=10
+with_lock() {
+  local lockdir="$STARTUP.lock" waited=0 now lockedat
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    if [ -f "$lockdir/acquired" ]; then
+      now=$(date +%s)
+      lockedat=$(cat "$lockdir/acquired" 2>/dev/null || echo "$now")
+      if [ $((now - lockedat)) -gt "$LOCK_STALE_SECS" ]; then
+        rm -rf "$lockdir"
+        continue
+      fi
+    fi
+    waited=$((waited + 1))
+    if [ "$waited" -gt 50 ]; then
+      echo "Operator: timed out waiting for the startup-script lock" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  date +%s > "$lockdir/acquired" 2>/dev/null
+  "$@"
+  local rc=$?
+  rm -rf "$lockdir"
+  return $rc
+}
+
+# Idempotently strip our marker block, then re-append it. Exact-line marker
+# match (not substring) so the string appearing inside unrelated content
+# elsewhere in the file can't be mistaken for our block. A unique per-call tmp
+# name, since with_lock is the only thing making this safe against a
+# concurrent run, not the filename itself.
 strip_block() {
   [ -f "$STARTUP" ] || return 0
-  awk -v b="$BEGIN" -v e="$END" 'index($0,b){s=1} !s{print} index($0,e){s=0}' \
-    "$STARTUP" > "$STARTUP.tmp" && mv "$STARTUP.tmp" "$STARTUP"
+  local tmp
+  tmp="$(mktemp "$STARTUP.XXXXXX")" || return 1
+  if awk -v b="$BEGIN" -v e="$END" '$0==b{s=1} !s{print} $0==e{s=0}' "$STARTUP" > "$tmp"; then
+    mv "$tmp" "$STARTUP"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
 }
-enable_autostart() {
+enable_autostart() { with_lock _enable_autostart_locked; }
+_enable_autostart_locked() {
   [ -f "$STARTUP" ] || printf '#!/bin/bash\n' > "$STARTUP"
   strip_block
   printf '\n%s\n%s\n%s\n' "$BEGIN" "$RUNLINE" "$END" >> "$STARTUP"
   chmod +x "$STARTUP"
 }
-disable_autostart() { strip_block; }
+disable_autostart() { with_lock strip_block; }
 
 start_bridge() {
   is_running && return 0
@@ -100,6 +153,22 @@ start_bridge() {
   "$BIN" bridge > "$LOG" 2>&1 &
 }
 stop_bridge() { pkill -f "$BIN bridge" 2>/dev/null; sleep 1; }
+
+# uninstall stops the bridge, removes autostart, and restores the original
+# Zaparoo config if ensure_config replaced it -- otherwise a user who had
+# other readers (NFC, etc.) working before installing Operator is left with
+# auto_detect=false and a dead file-reader entry forever, with no path back to
+# their working setup. Returns 0 if a config was restored, 1 if there was
+# nothing to restore.
+uninstall() {
+  stop_bridge
+  disable_autostart
+  if [ -f "$ZAPCFG.pre-operator" ]; then
+    mv "$ZAPCFG.pre-operator" "$ZAPCFG"
+    return 0
+  fi
+  return 1
+}
 
 status_text() {
   local r a o now
@@ -133,7 +202,11 @@ menu() {
       5) disable_autostart; dialog --msgbox "Autostart disabled." 6 40 ;;
       6) touch "$LOG"; dialog --title "Live — insert a cartridge to watch it read (Exit to return)" --tailbox "$LOG" 22 78 ;;
       7) [ -s "$LOG" ] && dialog --title "Log" --textbox "$LOG" 20 72 || dialog --msgbox "No log yet." 6 30 ;;
-      8) stop_bridge; disable_autostart; dialog --msgbox "Bridge stopped and autostart removed.\nFiles kept in $OPDIR." 7 56 ;;
+      8) if uninstall; then
+           dialog --msgbox "Bridge stopped, autostart removed, and your original Zaparoo config was restored.\nFiles kept in $OPDIR." 8 60
+         else
+           dialog --msgbox "Bridge stopped and autostart removed.\nFiles kept in $OPDIR." 7 56
+         fi ;;
     esac
   done
   clear
