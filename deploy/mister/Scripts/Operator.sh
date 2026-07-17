@@ -12,6 +12,7 @@ BIN="${BIN:-$OPDIR/zaparoo-operator}"
 LOG="${LOG:-/tmp/zaparoo-operator.log}"
 TOKEN="${TOKEN:-/tmp/zaparoo-operator.token}"
 STATUS="${STATUS:-/tmp/zaparoo-operator.status}"
+LOCK="${LOCK:-/tmp/zaparoo-operator.lock}"
 STARTUP="${STARTUP:-/media/fat/linux/user-startup.sh}"
 ZAPCFG="${ZAPCFG:-/media/fat/zaparoo/config.toml}"
 ZAPSH="${ZAPSH:-/media/fat/Scripts/zaparoo.sh}"
@@ -19,7 +20,17 @@ BEGIN="#==== Epilogue Operator BEGIN ===="
 END="#==== Epilogue Operator END ===="
 RUNLINE="[ \"\$1\" != \"stop\" ] && [ -x $BIN ] && $BIN bridge > $LOG 2>&1 &"
 
-is_running()        { pgrep -f "$BIN bridge" >/dev/null 2>&1; }
+# is_running reads the PID the daemon itself records in $LOCK (its
+# single-instance flock file, held for its whole lifetime) and checks
+# /proc/<pid> -- not pgrep, which some MiSTer-family busybox builds compile
+# out entirely (CONFIG_PGREP/CONFIG_PKILL unset, leaving only pidof). On such
+# a build `pgrep -f ...` used to fail with "not found" under the >/dev/null
+# guard, so is_running() silently reported "stopped" no matter what -- which
+# also broke start_bridge()'s idempotency check below, letting autostart and
+# every later menu visit each launch a new bridge process. /proc and kill are
+# always present, so this has no such gap.
+running_pid() { [ -s "$LOCK" ] && cat "$LOCK" 2>/dev/null; }
+is_running()  { local pid; pid="$(running_pid)"; [ -n "$pid" ] && [ -d "/proc/$pid" ]; }
 autostart_enabled() { [ -f "$STARTUP" ] && grep -qF "$BEGIN" "$STARTUP"; }
 operator_present()  { "$BIN" detect 2>/dev/null | grep -qi "Operator"; }
 
@@ -152,7 +163,27 @@ start_bridge() {
   [ -e "$ZAPSH" ] && "$ZAPSH" -service start >/dev/null 2>&1
   "$BIN" bridge > "$LOG" 2>&1 &
 }
-stop_bridge() { pkill -f "$BIN bridge" 2>/dev/null; sleep 1; }
+
+# stop_bridge signals the daemon and waits for it to actually exit (up to
+# STOP_WAIT_SECS) instead of a blind sleep -- Run() does a final save flush
+# on shutdown, which can legitimately take longer than a fixed guess, and a
+# following start_bridge() must not race a lock the old process still holds.
+# Falls back to SIGKILL if the daemon doesn't exit in time.
+STOP_WAIT_SECS=10
+stop_bridge() {
+  local pid waited=0
+  pid="$(running_pid)"
+  [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 0
+  kill "$pid" 2>/dev/null
+  while [ -d "/proc/$pid" ]; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt $((STOP_WAIT_SECS * 10)) ]; then
+      kill -9 "$pid" 2>/dev/null
+      break
+    fi
+    sleep 0.1
+  done
+}
 
 # uninstall stops the bridge, removes autostart, and restores the original
 # Zaparoo config if ensure_config replaced it -- otherwise a user who had
