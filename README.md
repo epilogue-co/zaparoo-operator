@@ -17,7 +17,7 @@ extract it onto your SD card root — it drops straight into `/media/fat`.
 Then on the MiSTer: F12 -> Scripts -> Operator. First run sets up the Zaparoo
 config, turns on autostart, and starts the bridge. That same menu entry is
 also the manager afterwards — start/stop, autostart on/off, live log,
-uninstall. See `deploy/mister/README.md` for exactly what the installer does.
+uninstall.
 
 The Operator needs Zaparoo Core v2.9.1+ — the menu warns if yours is older.
 
@@ -50,6 +50,23 @@ Nothing outlives the session except what's actually on the cartridge.
 | Game Boy Advance | |
 | Super Nintendo | title shown is a generated name for now |
 | Nintendo 64 | save write-back is experimental |
+
+## SuperStation One
+
+Works out of the box: the installer keeps the built-in NFC reader working and
+starts the Zaparoo service at boot. Update the shipped Zaparoo Core (v2.6.2)
+when the menu suggests it. While the Operator is installed, NFC cards run in
+hold mode — the game exits a couple of seconds after the card leaves the pad
+(buttons/stickers that stay put are unaffected). Firmware updates are full
+reflashes: re-extract the zip and run Operator once afterwards.
+
+## Troubleshooting
+
+The menu header shows the whole stack: bridge build, Zaparoo Core version,
+and live service state. "Playing X" with nothing on screen means the Zaparoo
+side is down or outdated — update Core and reboot. To report a problem, use
+menu item 7 (*Status snapshot*) and photograph the screen; it carries the
+versions, config state, and recent errors from both logs.
 
 ## Notes
 
