@@ -19,6 +19,16 @@ config, turns on autostart, and starts the bridge. That same menu entry is
 also the manager afterwards — start/stop, autostart on/off, live log,
 uninstall. See `deploy/mister/README.md` for exactly what the installer does.
 
+The Operator needs Zaparoo Core v2.9.1+ — the menu warns if yours is older.
+
+## Update
+
+- **Operator:** in its menu choose **Stop bridge**, extract the new release
+  zip over `/media/fat`, then open Scripts -> Operator again (or reboot).
+- **Zaparoo Core:** use `update_all` — enable **Zaparoo** under its
+  *Tools & Scripts* settings first (it's off by default), then update as
+  usual.
+
 ## What it does
 
 On insert, the bridge verifies the cartridge is real, reads the ROM into a
