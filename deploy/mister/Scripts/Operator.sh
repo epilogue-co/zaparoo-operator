@@ -73,13 +73,30 @@ is_superstation() {
 # which shifts if another USB-serial adapter enumerates first. by-id is NOT
 # usable here: CH340s carry no serial number, so every CH340 on the system
 # collapses to the same generic by-id name.
+# usb_id walks up from a tty's sysfs device node until it finds the USB
+# device descriptors, printing "vid pid". The depth differs by driver class:
+# for ttyACM the interface sits at device/.. and the descriptors one above,
+# but ttyUSB adds a usb-serial port layer, putting them at device/../.. --
+# reading a fixed depth is exactly the field bug that left a real
+# SuperStation's NFC reader undetected (and therefore disabled).
+usb_id() {
+  local d="$1/device"
+  for _ in 1 2 3 4; do
+    d="$d/.."
+    if [ -f "$d/idVendor" ] && [ -f "$d/idProduct" ]; then
+      printf '%s %s\n' "$(cat "$d/idVendor" 2>/dev/null)" "$(cat "$d/idProduct" 2>/dev/null)"
+      return 0
+    fi
+  done
+  return 1
+}
+
 internal_nfc_path() {
-  local tty dev vid pid link
+  local tty dev link ids
   for tty in "$NFC_SYS"/ttyUSB*; do
     [ -e "$tty" ] || continue
-    vid="$(cat "$tty/device/../idVendor" 2>/dev/null)"
-    pid="$(cat "$tty/device/../idProduct" 2>/dev/null)"
-    [ "$vid" = "1a86" ] && [ "$pid" = "7523" ] || continue
+    ids="$(usb_id "$tty")" || continue
+    [ "$ids" = "1a86 7523" ] || continue
     dev="$NFC_DEV_PREFIX${tty##*/}"
     for link in "$NFC_BYPATH"/*; do
       [ -e "$link" ] || continue
@@ -480,6 +497,12 @@ snapshot() {
   {
     printf 'Operator %s | Zaparoo %s\n' "$(bridge_version)" "$(zap_health)"
     config_summary
+    # Detection diagnostics: on a SuperStation, "markers yes, nfc-bridge no"
+    # (or vice versa) pinpoints which half of sso_nfc failed in the field.
+    local m c
+    is_superstation && m=yes || m=no
+    internal_nfc_path >/dev/null && c=yes || c=no
+    echo "superstation: markers $m, nfc-bridge $c"
     echo "--- bridge log (latest) ---"
     if [ -s "$LOG" ]; then wrap <"$LOG" | tail -n 9; else echo "(no bridge log yet)"; fi
     echo "--- zaparoo problems (latest) ---"
