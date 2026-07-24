@@ -389,9 +389,13 @@ zap_health() {
   local zv zs
   zv="$(zap_version)"
   if [ -n "$zv" ]; then
+    # `-service status` prints "started" (not "running") on every Core
+    # version back to at least v2.6.2; anything else means the status call
+    # itself failed (e.g. a config the Core refuses to load).
     zs="$("$ZAPSH" -service status 2>/dev/null | tail -1)"
     case "$zs" in
-      running | stopped) ;;
+      started) zs="running" ;;
+      stopped) ;;
       *) zs="ERROR" ;;
     esac
     printf 'v%s, service %s\n' "$zv" "$zs"
