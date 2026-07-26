@@ -53,12 +53,7 @@ Nothing outlives the session except what's actually on the cartridge.
 
 ## SuperStation One
 
-Works out of the box: the installer keeps the built-in NFC reader working and
-starts the Zaparoo service at boot. Update the shipped Zaparoo Core (v2.6.2)
-when the menu suggests it. While the Operator is installed, NFC cards run in
-hold mode — the game exits a couple of seconds after the card leaves the pad
-(buttons/stickers that stay put are unaffected). Firmware updates are full
-reflashes: re-extract the zip and run Operator once afterwards.
+Update your Zaparoo installation using https://github.com/theypsilon/Update_All_MiSTer.
 
 ## Troubleshooting
 
