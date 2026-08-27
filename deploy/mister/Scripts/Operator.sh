@@ -7,7 +7,15 @@
 
 # Paths are overridable via environment so Operator_test.sh can point them at
 # a temp dir; defaults are the real MiSTer locations.
-OPDIR="${OPDIR:-/media/fat/Scripts/.operator}"
+OPDIR_NEW="${OPDIR_NEW:-/media/fat/operator}"
+OPDIR_LEGACY="${OPDIR_LEGACY:-/media/fat/Scripts/.operator}"
+if [ -z "${OPDIR:-}" ]; then
+  if [ -f "$OPDIR_LEGACY/zaparoo-operator" ] && [ ! -f "$OPDIR_NEW/zaparoo-operator" ]; then
+    OPDIR="$OPDIR_LEGACY"
+  else
+    OPDIR="$OPDIR_NEW"
+  fi
+fi
 BIN="${BIN:-$OPDIR/zaparoo-operator}"
 LOG="${LOG:-/tmp/zaparoo-operator.log}"
 TOKEN="${TOKEN:-/tmp/zaparoo-operator.token}"
@@ -30,9 +38,17 @@ END="#==== Epilogue Operator END ===="
 # all, so nothing else starts the service at boot and the bridge would write
 # launch tokens nobody reads. `-service start` no-ops when the service is
 # already running, so this is safe alongside Zaparoo's own or Console Mode's
-# startup line.
-ZAPLINE="[ \"\$1\" != \"stop\" ] && [ -e $ZAPSH ] && $ZAPSH -service start >/dev/null 2>&1"
-RUNLINE="[ \"\$1\" != \"stop\" ] && [ -x $BIN ] && $BIN bridge > $LOG 2>&1 &"
+ZAPLINE="[ \"\$1\" != \"stop\" ] && [ -e $ZAPSH ] && $ZAPSH -service start >/dev/null 2>&1 &"
+launch_mode() {
+  check_zap_version
+  if [ -n "$ZAPNATIVE" ]; then printf 'system'; else printf 'forced'; fi
+}
+bridge_cmd() {
+  printf '%s' "$BIN bridge --token $TOKEN --status $STATUS --lock $LOCK --sounds $OPDIR/sounds --launch-mode $(launch_mode)"
+}
+runline() {
+  printf '%s' "[ \"\$1\" != \"stop\" ] && [ -x $BIN ] && $(bridge_cmd) > $LOG 2>&1 &"
+}
 
 # is_running reads the PID the daemon itself records in $LOCK (its
 # single-instance flock file, held for its whole lifetime) and checks
@@ -43,8 +59,23 @@ RUNLINE="[ \"\$1\" != \"stop\" ] && [ -x $BIN ] && $BIN bridge > $LOG 2>&1 &"
 # also broke start_bridge()'s idempotency check below, letting autostart and
 # every later menu visit each launch a new bridge process. /proc and kill are
 # always present, so this has no such gap.
-running_pid() { [ -s "$LOCK" ] && cat "$LOCK" 2>/dev/null; }
-is_running()  { local pid; pid="$(running_pid)"; [ -n "$pid" ] && [ -d "/proc/$pid" ]; }
+running_pid() { [ -s "$LOCK" ] && head -1 "$LOCK" 2>/dev/null; }
+running_version() { [ -s "$LOCK" ] && sed -n 2p "$LOCK" 2>/dev/null; }
+proc_alive() {
+  if [ -d /proc ]; then [ -d "/proc/$1" ]; else kill -0 "$1" 2>/dev/null; fi
+}
+proc_is_ours() {
+  local pid="$1" cmd
+  proc_alive "$pid" || return 1
+  [ -d /proc ] || return 0
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  [ -z "$cmd" ] && return 0
+  case "$cmd" in
+    *zaparoo-operator*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+is_running() { local pid; pid="$(running_pid)"; [ -n "$pid" ] && proc_is_ours "$pid"; }
 autostart_enabled() { [ -f "$STARTUP" ] && grep -qF "$BEGIN" "$STARTUP"; }
 operator_present()  { "$BIN" detect 2>/dev/null | grep -qi "Operator"; }
 
@@ -130,21 +161,25 @@ sso_nfc() { is_superstation && internal_nfc_path; }
 # with the console's built-in reader missing) gets rewritten.
 config_ok() {
   [ -f "$ZAPCFG" ] || return 1
-  # config_schema is not optional decoration: Zaparoo v2.6.2 (stock on the
-  # SuperStation One) refuses to start AT ALL on a config without it ("schema
-  # version mismatch: got 0, expecting 1"), which turns a working console into
-  # a dead one. Requiring it here also heals configs written by installers
-  # that predate this check.
-  grep -Eq "^[[:space:]]*config_schema[[:space:]]*=[[:space:]]*1" "$ZAPCFG" || return 1
-  # Same zero-struct hazard: without an explicit api_port, v2.6.2 binds the
-  # API to a random port, cutting off the Zaparoo app and our -reload.
-  grep -Eq "^[[:space:]]*api_port[[:space:]]*=[[:space:]]*7497" "$ZAPCFG" || return 1
-  grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG" || return 1
+  check_zap_version
   grep -Eq "^[[:space:]]*mode[[:space:]]*=[[:space:]]*'?hold'?" "$ZAPCFG" || return 1
+  grep -Eq "^[[:space:]]*exit_delay[[:space:]]*=[[:space:]]*[0-9]" "$ZAPCFG" || return 1
+  if [ -n "$ZAPNATIVE" ]; then
+    if grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG"; then
+      return 1
+    fi
+    return 0
+  fi
+  grep -Eq "^[[:space:]]*config_schema[[:space:]]*=[[:space:]]*[0-9]+" "$ZAPCFG" || return 1
+  grep -Eq "^[[:space:]]*api_port[[:space:]]*=[[:space:]]*[0-9]+" "$ZAPCFG" || return 1
+  grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG" || return 1
   awk -v tok="$TOKEN" '
-    /^\[\[readers\.connect\]\]/ { driver=0; path=0 }
-    /^[[:space:]]*driver[[:space:]]*=/ { if ($0 ~ /file/) driver=1 }
-    /^[[:space:]]*path[[:space:]]*=/ { if (index($0, tok)) path=1 }
+    /^[[:space:]]*\[/ { inconn = ($0 ~ /^[[:space:]]*\[\[readers\.connect\]\]/); driver=0; path=0 }
+    inconn && /^[[:space:]]*driver[[:space:]]*=/ {
+      v=$0; sub(/^[^=]*=/,"",v); gsub(/[[:space:]"]/,"",v); gsub(/'\''/,"",v)
+      if (v=="file") driver=1
+    }
+    inconn && /^[[:space:]]*path[[:space:]]*=/ { if (index($0, tok)) path=1 }
     driver && path { found=1 }
     END { exit !found }
   ' "$ZAPCFG" || return 1
@@ -169,9 +204,21 @@ config_ok() {
 # user's device_id so app pairings survive the rewrite.
 write_config() {
   local nfc dev_id
-  nfc="$(sso_nfc)" || nfc=""
+  check_zap_version
   dev_id="$(grep -E "^[[:space:]]*device_id[[:space:]]*=" "$ZAPCFG" 2>/dev/null | head -1)"
   mkdir -p "$(dirname "$ZAPCFG")"
+  if [ -n "$ZAPNATIVE" ]; then
+    cat > "$ZAPCFG" <<EOF
+[service]
+$dev_id
+
+[readers.scan]
+mode = 'hold'
+exit_delay = 2.5
+EOF
+    return 0
+  fi
+  nfc="$(sso_nfc)" || nfc=""
   cat > "$ZAPCFG" <<EOF
 config_schema = 1
 
@@ -221,11 +268,52 @@ zap_reload() {
 # up the existing config and write ours (the user can re-add other readers from
 # the backup).
 CONFIG_REPLACED=0
+
+patch_scan_section() {
+  local tmp
+  tmp="$(mktemp "$ZAPCFG.XXXXXX")" || return 1
+  if awk '
+    /^[[:space:]]*\[readers\.scan\]/ {
+      insec=1; done=1
+      print; print "mode = '\''hold'\''"; print "exit_delay = 2.5"
+      next
+    }
+    /^[[:space:]]*\[/ && !/^[[:space:]]*\[readers\.scan\]/ { insec=0 }
+    insec && /^[[:space:]]*(mode|exit_delay)[[:space:]]*=/ { next }
+    /^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false/ {
+      sub(/false/, "true")
+    }
+    { print }
+    END {
+      if (!done) {
+        print ""; print "[readers.scan]"
+        print "mode = '\''hold'\''"; print "exit_delay = 2.5"
+      }
+    }
+  ' "$ZAPCFG" > "$tmp"; then
+    mv "$tmp" "$ZAPCFG"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 ensure_config() {
   config_ok && return 0
+  check_zap_version
   if [ -f "$ZAPCFG" ]; then
-    # Keep the FIRST backup (the user's original); don't clobber it on a later run.
-    [ -f "$ZAPCFG.pre-operator" ] || cp -p "$ZAPCFG" "$ZAPCFG.pre-operator" 2>/dev/null
+    if [ -f "$ZAPCFG.pre-operator" ]; then
+      cp -p "$ZAPCFG" "$ZAPCFG.replaced" 2>/dev/null
+    else
+      cp -p "$ZAPCFG" "$ZAPCFG.pre-operator" 2>/dev/null
+    fi
+    if [ -n "$ZAPNATIVE" ] && ! grep -qF "$TOKEN" "$ZAPCFG"; then
+      if patch_scan_section && config_ok; then
+        echo "Operator: adjusted Zaparoo scan settings (backup at $ZAPCFG.pre-operator)" >&2
+        zap_reload
+        return 0
+      fi
+    fi
     CONFIG_REPLACED=1
     echo "Operator: replaced Zaparoo config (backup at $ZAPCFG.pre-operator)" >&2
   fi
@@ -242,7 +330,10 @@ ensure_config() {
 # on every run, not just at install. Warn, don't block: the common flows still
 # work, and updating is one Update All run away.
 ZAPMINVER="2.9.1"
+ZAPNATIVEVER="2.16.0"
 ZAPVER_OLD=""
+ZAPNATIVE=""
+ZAPVER_CHECKED=""
 zap_version() {
   [ -e "$ZAPSH" ] || return 1
   "$ZAPSH" -version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
@@ -256,10 +347,13 @@ version_lt() { # true if dotted version $1 < $2 (numeric per field, so 2.15 > 2.
   [ "${a3:-0}" -lt "${b3:-0}" ]
 }
 check_zap_version() {
+  [ -n "$ZAPVER_CHECKED" ] && return 0
+  ZAPVER_CHECKED=1
   local v
   v="$(zap_version)" || return 0
   [ -n "$v" ] || return 0
   version_lt "$v" "$ZAPMINVER" && ZAPVER_OLD="$v"
+  version_lt "$v" "$ZAPNATIVEVER" || ZAPNATIVE=1
   return 0
 }
 notify_old_zaparoo() {
@@ -327,6 +421,7 @@ strip_block() {
   local tmp
   tmp="$(mktemp "$STARTUP.XXXXXX")" || return 1
   if awk -v b="$BEGIN" -v e="$END" '$0==b{s=1} !s{print} $0==e{s=0}' "$STARTUP" > "$tmp"; then
+    chmod 755 "$tmp"
     mv "$tmp" "$STARTUP"
   else
     rm -f "$tmp"
@@ -337,15 +432,28 @@ enable_autostart() { with_lock _enable_autostart_locked; }
 _enable_autostart_locked() {
   [ -f "$STARTUP" ] || printf '#!/bin/bash\n' > "$STARTUP"
   strip_block
-  printf '\n%s\n%s\n%s\n%s\n' "$BEGIN" "$ZAPLINE" "$RUNLINE" "$END" >> "$STARTUP"
+  printf '\n%s\n%s\n%s\n%s\n' "$BEGIN" "$ZAPLINE" "$(runline)" "$END" >> "$STARTUP"
   chmod +x "$STARTUP"
 }
 disable_autostart() { with_lock strip_block; }
 
+restart_on_update() {
+  is_running || return 0
+  local run new
+  run="$(running_version)"
+  [ -n "$run" ] || return 0
+  new="$(bridge_version)"
+  [ -n "$new" ] && [ "$new" != "?" ] || return 0
+  [ "$run" = "$new" ] && return 0
+  echo "Operator: running bridge is $run, installed binary is $new; restarting" >&2
+  stop_bridge
+  start_bridge
+}
+
 start_bridge() {
   is_running && return 0
   [ -e "$ZAPSH" ] && "$ZAPSH" -service start >/dev/null 2>&1
-  "$BIN" bridge > "$LOG" 2>&1 &
+  "$BIN" bridge --token "$TOKEN" --status "$STATUS" --lock "$LOCK" --sounds "$OPDIR/sounds" --launch-mode "$(launch_mode)" > "$LOG" 2>&1 &
 }
 
 # stop_bridge signals the daemon and waits for it to actually exit (up to
@@ -357,9 +465,9 @@ STOP_WAIT_SECS=10
 stop_bridge() {
   local pid waited=0
   pid="$(running_pid)"
-  [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 0
+  [ -n "$pid" ] && proc_is_ours "$pid" || return 0
   kill "$pid" 2>/dev/null
-  while [ -d "/proc/$pid" ]; do
+  while proc_alive "$pid"; do
     waited=$((waited + 1))
     if [ "$waited" -gt $((STOP_WAIT_SECS * 10)) ]; then
       kill -9 "$pid" 2>/dev/null
@@ -378,6 +486,7 @@ stop_bridge() {
 uninstall() {
   stop_bridge
   disable_autostart
+  rm -f "$TOKEN"
   if [ -f "$ZAPCFG.pre-operator" ]; then
     mv "$ZAPCFG.pre-operator" "$ZAPCFG"
     zap_reload
@@ -406,12 +515,9 @@ zap_health() {
   local zv zs
   zv="$(zap_version)"
   if [ -n "$zv" ]; then
-    # `-service status` prints "started" (not "running") on every Core
-    # version back to at least v2.6.2; anything else means the status call
-    # itself failed (e.g. a config the Core refuses to load).
     zs="$("$ZAPSH" -service status 2>/dev/null | tail -1)"
     case "$zs" in
-      started) zs="running" ;;
+      started | running) zs="running" ;;
       stopped) ;;
       *) zs="ERROR" ;;
     esac
@@ -455,11 +561,11 @@ zap_recent_problems() {
     echo "(no zaparoo log found)"
     return 0
   }
-  if ! grep -q '"level":"error"' "$zl" 2>/dev/null; then
+  if ! grep -Eq '"level":"error"|launch blocked' "$zl" 2>/dev/null; then
     echo "(no errors in zaparoo log)"
     return 0
   fi
-  grep '"level":"error"' "$zl" | tail -n 4 | while IFS= read -r line; do
+  grep -E '"level":"error"|launch blocked' "$zl" | tail -n 4 | while IFS= read -r line; do
     t="$(printf '%s' "$line" | sed -n 's/.*"time":"[^T]*T\([0-9:]\{8\}\).*/\1/p')"
     msg="$(printf '%s' "$line" | sed 's/.*"message":"//;s/".*//')"
     err=""
@@ -477,12 +583,22 @@ config_summary() {
     echo "config: MISSING"
     return 0
   }
+  check_zap_version
   local s="config:"
-  grep -Eq "^[[:space:]]*config_schema[[:space:]]*=[[:space:]]*1" "$ZAPCFG" && s="$s schema" || s="$s NO-SCHEMA"
-  grep -Eq "^[[:space:]]*api_port[[:space:]]*=[[:space:]]*7497" "$ZAPCFG" && s="$s api" || s="$s NO-API-PORT"
   grep -Eq "^[[:space:]]*mode[[:space:]]*=[[:space:]]*'?hold'?" "$ZAPCFG" && s="$s hold" || s="$s NO-HOLD"
-  grep -Eq "^[[:space:]]*driver[[:space:]]*=[[:space:]]*'?file'?" "$ZAPCFG" && s="$s file" || s="$s NO-FILE-READER"
-  grep -Eq "^[[:space:]]*driver[[:space:]]*=[[:space:]]*'?pn532" "$ZAPCFG" && s="$s pn532"
+  grep -Eq "^[[:space:]]*exit_delay[[:space:]]*=[[:space:]]*[0-9]" "$ZAPCFG" && s="$s delay" || s="$s NO-EXIT-DELAY"
+  if [ -n "$ZAPNATIVE" ]; then
+    if grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG"; then
+      s="$s AUTODETECT-OFF"
+    else
+      s="$s native"
+    fi
+  else
+    grep -Eq "^[[:space:]]*config_schema[[:space:]]*=[[:space:]]*[0-9]+" "$ZAPCFG" && s="$s schema" || s="$s NO-SCHEMA"
+    grep -Eq "^[[:space:]]*api_port[[:space:]]*=[[:space:]]*[0-9]+" "$ZAPCFG" && s="$s api" || s="$s NO-API-PORT"
+    grep -Eq "^[[:space:]]*driver[[:space:]]*=[[:space:]]*'?file'?" "$ZAPCFG" && s="$s file" || s="$s NO-FILE-READER"
+    grep -Eq "^[[:space:]]*driver[[:space:]]*=[[:space:]]*'?pn532" "$ZAPCFG" && s="$s pn532"
+  fi
   echo "$s"
 }
 
@@ -562,20 +678,22 @@ menu() {
 # Guarded so Operator_test.sh can source this file for its functions without
 # running the installer.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-  if [ ! -x "$BIN" ]; then
-    echo "ERROR: $BIN not found. Reinstall the Operator bridge." >&2
+  [ -f "$BIN" ] && chmod +x "$BIN" 2>/dev/null
+  if [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; then
+    echo "ERROR: $BIN is missing or not an executable file." >&2
+    echo "Copy EVERYTHING from the release zip onto the SD card: the Scripts folder AND the operator folder." >&2
     sleep 3; exit 1
   fi
 
-  # First run sets everything up; thereafter it (re)confirms and shows the menu.
+  check_zap_version
   ensure_config
   notify_config_replaced
-  check_zap_version
   notify_old_zaparoo
   # Always re-assert (idempotent): an older install's block predates the
   # Zaparoo service line, and a SuperStation firmware update is a full SD
   # reflash that wipes user-startup.sh entirely -- both self-heal here.
   enable_autostart
+  restart_on_update
   start_bridge
 
   if command -v dialog >/dev/null 2>&1 && [ -t 1 ]; then
