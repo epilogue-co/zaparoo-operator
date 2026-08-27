@@ -23,11 +23,17 @@ The Operator needs Zaparoo Core v2.9.1+ — the menu warns if yours is older.
 
 ## Update
 
-- **Operator:** in its menu choose **Stop bridge**, extract the new release
-  zip over `/media/fat`, then open Scripts -> Operator again (or reboot).
-- **Zaparoo Core:** use `update_all` — enable **Zaparoo** under its
+- **Operator:** automatic. The release zip includes
+  `downloader_operator.ini`, which enrolls the Operator in MiSTer Downloader
+  / `update_all` updates. An update run fetches the new build and prompts
+  the usual reboot to activate it; opening Scripts -> Operator also switches
+  a running bridge to a newly installed build. (Delete that file from the SD
+  root to opt out; manual updates then work as before: **Stop bridge**,
+  extract the new zip over `/media/fat`, reopen Scripts -> Operator.)
+- **Zaparoo Core:** use `update_all`: enable **Zaparoo** under its
   *Tools & Scripts* settings first (it's off by default), then update as
-  usual.
+  usual. On Core v2.16.0+ the Operator uses Zaparoo's built-in integration
+  and honors your configured launcher preferences.
 
 ## What it does
 
