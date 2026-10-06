@@ -1,5 +1,5 @@
 #!/bin/bash
-# Epilogue Operator for MiSTer — installer & manager.
+# Epilogue Operator for MiSTer: installer & manager.
 #
 # Bridges an Epilogue Operator (USB cartridge reader) to Zaparoo: insert a
 # cartridge and the matching FPGA core launches automatically; remove it to
@@ -31,6 +31,7 @@ RRDIR="${RRDIR:-/media/fat/Scripts/.config/Retroremake}"
 NFC_SYS="${NFC_SYS:-/sys/class/tty}"
 NFC_BYPATH="${NFC_BYPATH:-/dev/serial/by-path}"
 NFC_DEV_PREFIX="${NFC_DEV_PREFIX:-/dev/}"
+PROC="${PROC:-/proc}"
 BEGIN="#==== Epilogue Operator BEGIN ===="
 END="#==== Epilogue Operator END ===="
 # The autostart block starts the Zaparoo service before the bridge: the
@@ -149,6 +150,21 @@ internal_nfc_path() {
 # device with PN532 wake probes every second.
 sso_nfc() { is_superstation && internal_nfc_path; }
 
+# native_conn_state prints the driver of every [[readers.connect]] entry whose
+# path is our token file ("file" for the pre-2.16 file-reader setup, "operator" for the
+# built-in reader pinned explicitly).
+native_conn_state() {
+  awk -v tok="$TOKEN" '
+    function emit() { if (inconn && pth && drv != "") print drv }
+    /^[[:space:]]*\[/ { emit(); inconn = ($0 ~ /^[[:space:]]*\[\[readers\.connect\]\]/); drv = ""; pth = 0 }
+    inconn && /^[[:space:]]*driver[[:space:]]*=/ {
+      v = $0; sub(/^[^=]*=/, "", v); gsub(/[[:space:]"'\'']/, "", v); drv = v
+    }
+    inconn && /^[[:space:]]*path[[:space:]]*=/ { if (index($0, tok)) pth = 1 }
+    END { emit() }
+  ' "$ZAPCFG" 2>/dev/null
+}
+
 # config_ok reports whether the Zaparoo config already has the settings the
 # Operator needs: auto_detect off (so libnfc/pn532 don't grab our /dev/ttyACM*),
 # hold mode (so removing the cart stops the core), and a [[readers.connect]]
@@ -157,16 +173,22 @@ sso_nfc() { is_superstation && internal_nfc_path; }
 # survive with its driver commented out, silently doing nothing. Matches must
 # be on real (non-commented) setting lines, so a commented-out block never
 # makes a broken config look ok. On a SuperStation One it additionally
-# requires a pn532 reader entry, so a config written before SSO support (or
-# with the console's built-in reader missing) gets rewritten.
+# requires a pn532 reader entry. On a 2.16+ Core the requirements are hold
+# mode and the exit delay, no file entry of ours, and, with auto_detect off,
+# an operator entry on our token.
 config_ok() {
   [ -f "$ZAPCFG" ] || return 1
   check_zap_version
   grep -Eq "^[[:space:]]*mode[[:space:]]*=[[:space:]]*'?hold'?" "$ZAPCFG" || return 1
   grep -Eq "^[[:space:]]*exit_delay[[:space:]]*=[[:space:]]*[0-9]" "$ZAPCFG" || return 1
   if [ -n "$ZAPNATIVE" ]; then
+    # Our pre-2.16 file-reader entry gets converted to the built-in operator
+    # driver in place.
+    native_conn_state | grep -q "file" && return 1
+    # auto_detect is the user's choice and is never flipped: with it off, the
+    # built-in reader must be pinned by an explicit operator entry instead.
     if grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG"; then
-      return 1
+      native_conn_state | grep -q "operator" || return 1
     fi
     return 0
   fi
@@ -262,17 +284,38 @@ zap_reload() {
   return 0
 }
 
-# ensure_config guarantees the required settings are present. The old version
-# skipped when ANY config existed, so an existing Zaparoo user silently never got
-# auto_detect=false and nothing launched. Now: if the settings are missing we back
-# up the existing config and write ours (the user can re-add other readers from
-# the backup).
+# ensure_config guarantees the required settings are present: if any are
+# missing, it backs up the config and patches it in place. A file that
+# doesn't parse as TOML is replaced (other readers can be re-added from the
+# backup).
 CONFIG_REPLACED=0
 
+# patch_scan_section edits a 2.16+ config in place: hold mode and the exit
+# delay under [readers.scan], and our file entry converted to driver
+# 'operator'. auto_detect is never changed (turned on, Core probes serial
+# ports for NFC readers, the Operator's ttyACM included); with it off and no
+# entry of ours, an operator entry is appended. Everything else passes
+# through.
 patch_scan_section() {
-  local tmp
+  local tmp adoff=0 pin=0
+  grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG" && adoff=1
+  [ "$adoff" = 1 ] && [ -z "$(native_conn_state)" ] && pin=1
   tmp="$(mktemp "$ZAPCFG.XXXXXX")" || return 1
-  if awk '
+  if awk -v tok="$TOKEN" -v pin="$pin" '
+    function flush(   i) {
+      for (i = 1; i <= nconn; i++) {
+        if (ours && conn[i] ~ /^[[:space:]]*driver[[:space:]]*=/) print "driver = '\''operator'\''"
+        else print conn[i]
+      }
+      nconn = 0; ours = 0; inconn = 0
+    }
+    /^[[:space:]]*\[/ { flush() }
+    /^[[:space:]]*\[\[readers\.connect\]\]/ { inconn = 1 }
+    inconn {
+      conn[++nconn] = $0
+      if ($0 ~ /^[[:space:]]*path[[:space:]]*=/ && index($0, tok)) ours = 1
+      next
+    }
     /^[[:space:]]*\[readers\.scan\]/ {
       insec=1; done=1
       print; print "mode = '\''hold'\''"; print "exit_delay = 2.5"
@@ -280,14 +323,16 @@ patch_scan_section() {
     }
     /^[[:space:]]*\[/ && !/^[[:space:]]*\[readers\.scan\]/ { insec=0 }
     insec && /^[[:space:]]*(mode|exit_delay)[[:space:]]*=/ { next }
-    /^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false/ {
-      sub(/false/, "true")
-    }
     { print }
     END {
+      flush()
       if (!done) {
         print ""; print "[readers.scan]"
         print "mode = '\''hold'\''"; print "exit_delay = 2.5"
+      }
+      if (pin) {
+        print ""; print "[[readers.connect]]"
+        print "driver = '\''operator'\''"; print "path = '\''" tok "'\''"
       }
     }
   ' "$ZAPCFG" > "$tmp"; then
@@ -296,6 +341,90 @@ patch_scan_section() {
     rm -f "$tmp"
     return 1
   fi
+}
+
+# patch_legacy_config is the pre-2.16 counterpart of patch_scan_section: it
+# adds only what the file reader setup needs to an existing config and keeps
+# everything else. Missing keys are inserted into their existing tables (or
+# the tables appended); config_schema goes first because a top-level key must
+# precede every table header. On a SuperStation the internal pn532 reader is
+# pinned too, since auto_detect goes off.
+patch_legacy_config() {
+  local tmp nfc
+  nfc="$(sso_nfc)" || nfc=""
+  tmp="$(mktemp "$ZAPCFG.XXXXXX")" || return 1
+  if awk -v tok="$TOKEN" -v nfc="$nfc" '
+    function hdr(l) { sub(/#.*/, "", l); gsub(/[[:space:]]/, "", l); return l }
+    NR == FNR {
+      if ($0 ~ /^[[:space:]]*\[/) {
+        sec = hdr($0); drv = 0; pth = 0
+        if (sec == "[service]") hasservice = 1
+        if (sec == "[readers]") hasreaders = 1
+        if (sec == "[readers.scan]") hasscan = 1
+      }
+      if ($0 ~ /^[[:space:]]*config_schema[[:space:]]*=/ && sec == "") schema = 1
+      if (sec == "[service]" && $0 ~ /^[[:space:]]*api_port[[:space:]]*=/) api = 1
+      if (sec == "[readers]" && $0 ~ /^[[:space:]]*auto_detect[[:space:]]*=/) ad = 1
+      if (sec == "[[readers.connect]]") {
+        if ($0 ~ /^[[:space:]]*driver[[:space:]]*=/) {
+          v = $0; sub(/^[^=]*=/, "", v); gsub(/[[:space:]"'\'']/, "", v)
+          if (v == "file") drv = 1
+          if (v ~ /^pn532/) haspn = 1
+        }
+        if ($0 ~ /^[[:space:]]*path[[:space:]]*=/ && index($0, tok)) pth = 1
+        if (drv && pth) hasfile = 1
+      }
+      next
+    }
+    FNR == 1 && !schema { print "config_schema = 1"; print "" }
+    /^[[:space:]]*\[/ {
+      sec = hdr($0); print
+      if (sec == "[service]" && !api) print "api_port = 7497"
+      if (sec == "[readers]" && !ad) print "auto_detect = false"
+      if (sec == "[readers.scan]") { print "mode = '\''hold'\''"; print "exit_delay = 2.5" }
+      next
+    }
+    sec == "[readers]" && /^[[:space:]]*auto_detect[[:space:]]*=/ { print "auto_detect = false"; next }
+    sec == "[readers.scan]" && /^[[:space:]]*(mode|exit_delay)[[:space:]]*=/ { next }
+    { print }
+    END {
+      if (!hasservice) { print ""; print "[service]"; print "api_port = 7497" }
+      if (!hasreaders) { print ""; print "[readers]"; print "auto_detect = false" }
+      if (!hasscan) { print ""; print "[readers.scan]"; print "mode = '\''hold'\''"; print "exit_delay = 2.5" }
+      if (!hasfile) { print ""; print "[[readers.connect]]"; print "driver = '\''file'\''"; print "path = '\''" tok "'\''" }
+      if (nfc != "" && !haspn) { print ""; print "[[readers.connect]]"; print "driver = '\''pn532_uart'\''"; print "path = '\''" nfc "'\''" }
+    }
+  ' "$ZAPCFG" "$ZAPCFG" > "$tmp"; then
+    mv "$tmp" "$ZAPCFG"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# looks_like_toml gates the in-place patchers: every line must be blank, a
+# comment, a table header, a key = value, or a continuation of a multi-line
+# array. Anything else (a truncated or hand-mangled file) can't be patched
+# into something Zaparoo will load, so it gets the full rewrite instead.
+looks_like_toml() {
+  [ -s "$ZAPCFG" ] || return 1
+  awk '
+    function count(s, c,   n) { n = gsub(c, "", s); return n }
+    {
+      line = $0; sub(/#.*/, "", line)
+      if (depth > 0) { depth += count(line, "\\[") - count(line, "\\]"); next }
+      if (line ~ /^[[:space:]]*$/) next
+      if (line ~ /^[[:space:]]*\[\[?[A-Za-z0-9_.-]+\]\]?[[:space:]]*$/) next
+      if (line ~ /^[[:space:]]*[A-Za-z0-9_."'\''-]+[[:space:]]*=/) {
+        v = line; sub(/^[^=]*=/, "", v)
+        depth = count(v, "\\[") - count(v, "\\]")
+        if (depth < 0) depth = 0
+        next
+      }
+      bad = 1; exit
+    }
+    END { exit bad }
+  ' "$ZAPCFG"
 }
 
 ensure_config() {
@@ -307,9 +436,11 @@ ensure_config() {
     else
       cp -p "$ZAPCFG" "$ZAPCFG.pre-operator" 2>/dev/null
     fi
-    if [ -n "$ZAPNATIVE" ] && ! grep -qF "$TOKEN" "$ZAPCFG"; then
-      if patch_scan_section && config_ok; then
-        echo "Operator: adjusted Zaparoo scan settings (backup at $ZAPCFG.pre-operator)" >&2
+    if looks_like_toml; then
+      local patch=patch_legacy_config
+      [ -n "$ZAPNATIVE" ] && patch=patch_scan_section
+      if $patch && config_ok; then
+        echo "Operator: adjusted Zaparoo reader settings (backup at $ZAPCFG.pre-operator)" >&2
         zap_reload
         return 0
       fi
@@ -450,10 +581,68 @@ restart_on_update() {
   start_bridge
 }
 
+# stray_bridge_pids lists bridge processes other than the one in $LOCK
+# (bridges that never wrote a lock are invisible to is_running). It matches
+# argv[0] and argv[1], not a command-line substring, so a script that only
+# mentions the bridge isn't matched.
+stray_bridge_pids() {
+  local d pid own exe sub
+  [ -d "$PROC" ] || return 0
+  own="$(running_pid)"
+  for d in "$PROC"/[0-9]*; do
+    pid="${d##*/}"
+    [ "$pid" = "$own" ] && continue
+    [ "$pid" = "$$" ] && continue
+    exe="" sub=""
+    { IFS= read -r -d '' exe; IFS= read -r -d '' sub; } 2>/dev/null < "$d/cmdline"
+    case "$exe" in
+      zaparoo-operator | */zaparoo-operator) [ "$sub" = "bridge" ] && printf '%s\n' "$pid" ;;
+    esac
+  done
+}
+
+# STRAYS_STOPPED records that one was killed: a dying bridge writes "Stopped"
+# to the shared status file, so the live bridge's status is stale afterwards.
+STRAYS_STOPPED=""
+stop_stray_bridges() {
+  local pid waited
+  for pid in $(stray_bridge_pids); do
+    STRAYS_STOPPED=1
+    echo "Operator: stopping a stray bridge process ($pid)" >&2
+    kill "$pid" 2>/dev/null
+    waited=0
+    while [ -d "$PROC/$pid" ] && [ "$waited" -lt $((STOP_WAIT_SECS * 10)) ]; do
+      waited=$((waited + 1))
+      sleep 0.1
+    done
+    [ -d "$PROC/$pid" ] && kill -9 "$pid" 2>/dev/null
+  done
+  return 0
+}
+
+# retire_legacy_dir removes the legacy install under Scripts/.operator once
+# the current install is in place, so nothing (an old autostart line, a stale
+# manual start) can run the old binary again.
+retire_legacy_dir() {
+  [ "$OPDIR" = "$OPDIR_NEW" ] || return 0
+  [ -f "$OPDIR_NEW/zaparoo-operator" ] || return 0
+  [ -d "$OPDIR_LEGACY" ] || return 0
+  rm -rf "$OPDIR_LEGACY"
+}
+
+# start_bridge returns once the bridge holds $LOCK (or exits), so an
+# immediate is_running check can't start a second bridge that truncates $LOG.
+START_WAIT_SECS=5
 start_bridge() {
   is_running && return 0
   [ -e "$ZAPSH" ] && "$ZAPSH" -service start >/dev/null 2>&1
   "$BIN" bridge --token "$TOKEN" --status "$STATUS" --lock "$LOCK" --sounds "$OPDIR/sounds" --launch-mode "$(launch_mode)" > "$LOG" 2>&1 &
+  local pid=$! waited=0
+  while ! is_running && proc_alive "$pid" && [ "$waited" -lt $((START_WAIT_SECS * 10)) ]; do
+    waited=$((waited + 1))
+    sleep 0.1
+  done
+  return 0
 }
 
 # stop_bridge signals the daemon and waits for it to actually exit (up to
@@ -461,7 +650,10 @@ start_bridge() {
 # on shutdown, which can legitimately take longer than a fixed guess, and a
 # following start_bridge() must not race a lock the old process still holds.
 # Falls back to SIGKILL if the daemon doesn't exit in time.
-STOP_WAIT_SECS=10
+# 30s: a shutdown with a game running flushes the core's save through the OSD
+# and then programs the cartridge (a 128 KB flash save takes ~5s plus the
+# verify read); a SIGKILL in the middle of that tears the save on the cart.
+STOP_WAIT_SECS=30
 stop_bridge() {
   local pid waited=0
   pid="$(running_pid)"
@@ -588,11 +780,16 @@ config_summary() {
   grep -Eq "^[[:space:]]*mode[[:space:]]*=[[:space:]]*'?hold'?" "$ZAPCFG" && s="$s hold" || s="$s NO-HOLD"
   grep -Eq "^[[:space:]]*exit_delay[[:space:]]*=[[:space:]]*[0-9]" "$ZAPCFG" && s="$s delay" || s="$s NO-EXIT-DELAY"
   if [ -n "$ZAPNATIVE" ]; then
-    if grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG"; then
-      s="$s AUTODETECT-OFF"
-    else
-      s="$s native"
-    fi
+    case "$(native_conn_state)" in
+      *file*) s="$s LEGACY-FILE-READER" ;;
+      *operator*) s="$s native operator-pinned" ;;
+      *)
+        if grep -Eq "^[[:space:]]*auto_detect[[:space:]]*=[[:space:]]*false" "$ZAPCFG"; then
+          s="$s AUTODETECT-OFF-UNPINNED"
+        else
+          s="$s native"
+        fi ;;
+    esac
   else
     grep -Eq "^[[:space:]]*config_schema[[:space:]]*=[[:space:]]*[0-9]+" "$ZAPCFG" && s="$s schema" || s="$s NO-SCHEMA"
     grep -Eq "^[[:space:]]*api_port[[:space:]]*=[[:space:]]*[0-9]+" "$ZAPCFG" && s="$s api" || s="$s NO-API-PORT"
@@ -646,9 +843,9 @@ menu() {
       1) start_bridge ;;
       2) stop_bridge ;;
       3) stop_bridge; start_bridge ;;
-      4) ensure_config; enable_autostart; dialog --msgbox "Autostart enabled — the bridge starts on boot." 6 56 ;;
+      4) ensure_config; enable_autostart; dialog --msgbox "Autostart enabled. The bridge starts on boot." 6 56 ;;
       5) disable_autostart; dialog --msgbox "Autostart disabled." 6 40 ;;
-      6) touch "$LOG"; dialog --title "Live — insert a cartridge to watch it read (Exit to return)" --tailbox "$LOG" 22 78 ;;
+      6) touch "$LOG"; dialog --title "Live: insert a cartridge to watch it read (Exit to return)" --tailbox "$LOG" 22 78 ;;
       7) snapshot ;;
       8) if [ -s "$LOG" ]; then
            # dialog's textbox truncates long lines instead of wrapping, and on
@@ -693,6 +890,10 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   # Zaparoo service line, and a SuperStation firmware update is a full SD
   # reflash that wipes user-startup.sh entirely -- both self-heal here.
   enable_autostart
+  retire_legacy_dir
+  stop_stray_bridges
+  # Restart the live bridge so it rewrites the status a stray clobbered.
+  [ -n "$STRAYS_STOPPED" ] && stop_bridge
   restart_on_update
   start_bridge
 
