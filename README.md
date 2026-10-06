@@ -40,8 +40,8 @@ The Operator needs Zaparoo Core v2.9.1+ — the menu warns if yours is older.
 On insert, the bridge verifies the cartridge is real, reads the ROM into a
 RAM-backed scratch dir (never the SD card — nothing left behind if you pull
 the cart mid-session), seeds the emulator save from the cartridge, and
-launches the matching core through Zaparoo. Once the core has loaded the ROM,
-the working copy is deleted — the game runs from SDRAM.
+launches the matching core through Zaparoo. The working copy is deleted when
+you pull the cartridge.
 
 While you play, the bridge watches the core's save file and writes any
 change back to the cartridge, verifying each write before trusting it. Pull
@@ -54,7 +54,7 @@ Nothing outlives the session except what's actually on the cartridge.
 |---|---|
 | Game Boy / Color | |
 | Game Boy Advance | |
-| Super Nintendo | title shown is a generated name for now |
+| Super Nintendo | |
 | Nintendo 64 | save write-back is experimental |
 
 ## SuperStation One
